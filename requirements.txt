@@ -1,13 +1,13 @@
 pre-commit
 trimesh
-torch>=2
-torchvision
+# torch>=2
+# torchvision
 einops
 huggingface_hub
 imageio
 numpy<2
 opencv-python
-xformers
+# xformers
 open3d
 fastapi
 unicorn
@@ -21,3 +21,4 @@ moviepy
 plyfile
 pillow_heif
 safetensors
+addict
