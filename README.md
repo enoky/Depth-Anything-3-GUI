@@ -1,3 +1,20 @@
+## DAV3 GUI Setup Instructions:
+```bash
+# run these commands one at a time
+git clone https://github.com/enoky/Depth-Anything-3-GUI.git
+cd Depth-Anything-3-GUI
+python -m venv venv
+venv\scripts\activate
+pip install -r requirements.txt
+pip install gsplat # might not be required for da3mono model
+pip install -e .
+pip install -U xformers --index-url https://download.pytorch.org/whl/cu129
+pip install torchvision==0.23.0 --index-url https://download.pytorch.org/whl/cu129
+
+# to start the gui... (make sure venv is activated)
+python gui.py
+```
+
 <div align="center">
 <h1 style="border-bottom: none; margin-bottom: 0px ">Depth Anything 3: Recovering the Visual Space from Any Views</h1>
 <!-- <h2 style="border-top: none; margin-top: 3px;">Recovering the Visual Space from Any Views</h2> -->
