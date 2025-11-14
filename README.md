@@ -7,9 +7,9 @@ python -m venv venv
 venv\scripts\activate
 pip install -r requirements.txt
 pip install gsplat # might not be required for da3mono model
-pip install -e .
 pip install -U xformers --index-url https://download.pytorch.org/whl/cu129
 pip install torchvision==0.23.0 --index-url https://download.pytorch.org/whl/cu129
+pip install -e .
 
 # to start the gui... (make sure venv is activated)
 python gui.py
