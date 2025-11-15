@@ -92,11 +92,20 @@ def minmax_normalize(frame, min_value, max_value):
     if torch.is_tensor(min_value):
         min_value = min_value.to(frame.device)
         max_value = max_value.to(frame.device)
-    frame = 1.0 - ((frame - min_value) / (max_value - min_value))
+    
+    # --- START: Modified Normalization ---
+    # We now assume 'frame' is DISPARITY (1/depth), not depth.
+    # max_value will be max disparity (closest object)
+    # min_value will be min disparity (farthest object)
+    # (frame - min_value) / (max_value - min_value) scales this to 0-1.
+    frame = (frame - min_value) / (max_value - min_value)
+    # --- END: Modified Normalization ---
+
     frame = frame.clamp(0.0, 1.0)
     frame = frame.nan_to_num()
     return frame
 
+# --- START: Re-added Missing Classes ---
 
 class MinMaxBuffer():
     def __init__(self, size, dtype, device):
@@ -207,6 +216,49 @@ class EMAMinMaxScaler():
             self.reset()
             return frames
 
+# --- END: Re-added Missing Classes ---
+
+# --- START: Replaced Function ---
+def preprocess_depth_with_sky_mask(depth_tensor, sky_mask_tensor, sky_threshold=0.3):
+    """
+    Clamps the depth of sky pixels to a reasonable maximum (98th percentile
+    of non-sky depth). This pre-processed depth map can then be fed into
+    a temporal scaler to prevent flicker.
+    """
+    sky_mask = sky_mask_tensor > sky_threshold
+    
+    # Create a masked depth tensor where sky is invalid (NaN)
+    non_sky_depth = torch.where(sky_mask, float('nan'), depth_tensor)
+    
+    max_rel_dist = None
+    
+    # Check if there are any non-sky pixels
+    valid_non_sky_pixels = non_sky_depth[~torch.isnan(non_sky_depth)]
+    
+    if valid_non_sky_pixels.numel() > 0:
+        # Calculate 98th percentile from valid (non-sky) pixels
+        try:
+            max_rel_dist = torch.quantile(valid_non_sky_pixels, 0.98)
+        except (RuntimeError, IndexError):
+             _logger.warning("Could not calculate quantile, falling back to max.")
+             max_rel_dist = torch.max(valid_non_sky_pixels)
+    
+    if max_rel_dist is None:
+        # Fallback: whole image is sky or all values are NaN? Use 98th percentile of everything
+        try:
+            max_rel_dist = torch.quantile(depth_tensor, 0.98)
+        except (RuntimeError, IndexError):
+            _logger.warning("Could not calculate quantile on full tensor, falling back to max.")
+            max_rel_dist = torch.max(depth_tensor)
+        
+    # Clamp the original depth tensor
+    # Set all sky pixels to this max_rel_dist
+    clamped_depth = torch.where(sky_mask, max_rel_dist, depth_tensor)
+    
+    return clamped_depth
+# --- END: Replaced Function ---
+
+
 def _test():
     x = [float(i) for i in range(100)]
     zeros = [0 for i in range(100)]
@@ -244,7 +296,7 @@ def _test():
 # --- Content from create_depth_video.py ---
 
 def process_video(video_input, video_output, model, process_res, batch_size=1, progress_callback=None, stop_event=None, scaler=None,
-                  use_gamma=False, gamma_value=1.0):
+                  use_gamma=False, gamma_value=1.0, use_sky_mask_norm=False): # <-- Argument remains
     """
     Processes a single video file to create a depth map video.
     The model is passed as an argument to avoid reloading it for each video.
@@ -297,24 +349,54 @@ def process_video(video_input, video_output, model, process_res, batch_size=1, p
                 
                 processed_frames_to_write = []
                 for i in range(len(frames_buffer)):
-                    depth_map = prediction.depth[i]
                     
-                    if scaler:
-                        frame_tensor = scaler(torch.from_numpy(depth_map).to(model.device))
-                        if frame_tensor is not None:
-                            # Convert tensor to numpy for post-processing
-                            frame_np = frame_tensor.cpu().numpy()
+                    depth_map_np = prediction.depth[i]
+                    depth_tensor = torch.from_numpy(depth_map_np).to(model.device)
+                    frame_tensor = None
+                    
+                    if use_sky_mask_norm:
+                        # --- START: Modified Sky Mask Logic ---
+                        try:
+                            sky_mask_np = prediction.sky[i]
+                            sky_mask_tensor = torch.from_numpy(sky_mask_np).to(model.device)
                             
-                            # Apply post-processing
-                            if use_gamma:
-                                frame_np = apply_gamma_correction_to_video(frame_np, gamma_value)
-                                
-                            processed_frames_to_write.append(frame_np)
+                            # Pre-process the depth tensor to clamp sky values
+                            depth_tensor = preprocess_depth_with_sky_mask(depth_tensor, sky_mask_tensor)
+                            
+                        except AttributeError:
+                            _logger.error("Model output does not contain 'sky' attribute. Cannot use Sky Mask Pre-processing.")
+                            use_sky_mask_norm = False # Stop trying for this video
+                        except Exception as e:
+                            _logger.error(f"Error during sky mask pre-processing: {e}")
+                            use_sky_mask_norm = False # Stop trying for this video
+                        # --- END: Modified Sky Mask Logic ---
+
+                    # --- START: New Disparity Conversion Step ---
+                    # ALWAYS convert to disparity before scaling
+                    # This expands foreground detail and compresses background
+                    # Using 0.1 from your original function to prevent division by zero
+                    # and establish a "base" distance.
+                    disparity_tensor = 1.0 / (depth_tensor + 0.1)
+                    # --- END: New Disparity Conversion Step ---
+
+                    # --- Scaler logic is now ALWAYS applied ---
+                    if scaler:
+                        frame_tensor = scaler(disparity_tensor) # Pass the DISPARITY tensor
                     else:
-                        # Basic normalization if no scaler
-                        depth_tensor = torch.from_numpy(depth_map)
-                        depth_tensor = (depth_tensor - depth_tensor.min()) / (depth_tensor.max() - depth_tensor.min())
-                        frame_np = depth_tensor.cpu().numpy()
+                        # Basic Fallback (if scaler was None for some reason, though it shouldn't be)
+                         _logger.warning("Scaler not found, falling back to basic normalization.")
+                         # Normalize disparity, not depth
+                         disparity_tensor = (disparity_tensor - disparity_tensor.min()) / (disparity_tensor.max() - disparity_tensor.min())
+                         frame_tensor = disparity_tensor
+                    
+                    if frame_tensor is not None:
+                        # Convert tensor to numpy for post-processing
+                        frame_np = frame_tensor.cpu().numpy()
+                        
+                        # Apply post-processing
+                        if use_gamma:
+                            frame_np = apply_gamma_correction_to_video(frame_np, gamma_value)
+                            
                         processed_frames_to_write.append(frame_np)
 
                 if processed_frames_to_write:
@@ -328,8 +410,10 @@ def process_video(video_input, video_output, model, process_res, batch_size=1, p
             if not ret:
                 break
     finally:
+        # --- Updated Finally Block ---
+        # The scaler is now always used (unless it was None)
         if scaler:
-            # Process and write any remaining frames from the scaler's buffer
+            _logger.info("Flushing remaining frames from scaler...")
             flushed_frames = scaler.flush()
             flushed_np = [f.cpu().numpy() for f in flushed_frames]
             
@@ -341,6 +425,11 @@ def process_video(video_input, video_output, model, process_res, batch_size=1, p
             
             if final_frames_to_write:
                 write_frames(final_frames_to_write)
+        elif use_sky_mask_norm:
+             _logger.info("Sky mask normalization used, no scaler buffer to flush.")
+        else:
+             _logger.info("No scaler used, no buffer to flush.")
+        # --- End of Updated Block ---
 
         cap.release()
         out.release()
@@ -354,7 +443,7 @@ class DepthVideoGUI:
     def __init__(self, root):
         self.root = root
         self.root.title("Depth Video Creator")
-        self.root.geometry("500x550")
+        self.root.geometry("500x580") # Increased height slightly
         self.config_file = "gui_config.json"
         
         self.processing_thread = None
@@ -366,7 +455,10 @@ class DepthVideoGUI:
 
         # Post-processing variables
         self.use_gamma = tk.BooleanVar(value=False)
-        self.gamma_value = tk.DoubleVar(value=0.7)
+        self.gamma_value = tk.DoubleVar(value=1.0)
+        
+        # --- New variable ---
+        self.use_sky_mask = tk.BooleanVar(value=True)
 
         self.setup_ui()
         self.load_settings()
@@ -409,13 +501,27 @@ class DepthVideoGUI:
         self.batch_size = tk.IntVar(value=1)
         ttk.Spinbox(settings_frame, from_=1, to=100, increment=1, textvariable=self.batch_size, width=10).grid(row=1, column=1, sticky=tk.W)
         
-        ttk.Label(settings_frame, text="Decay:").grid(row=2, column=0, sticky=tk.W)
-        self.decay = tk.DoubleVar(value=0.9)
-        ttk.Spinbox(settings_frame, from_=0.0, to=1.0, increment=0.05, textvariable=self.decay, width=10).grid(row=2, column=1, sticky=tk.W)
+        # --- Updated: Made labels and spinboxes class attributes ---
+        self.decay_label = ttk.Label(settings_frame, text="Decay:")
+        self.decay_label.grid(row=2, column=0, sticky=tk.W)
+        self.decay = tk.DoubleVar(value=0.9) # MOVED UP
+        self.decay_spinbox = ttk.Spinbox(settings_frame, from_=0.0, to=1.0, increment=0.05, textvariable=self.decay, width=10)
+        self.decay_spinbox.grid(row=2, column=1, sticky=tk.W)
+        # self.decay_spinbox.config(textvariable=self.decay) # This line is redundant now
 
-        ttk.Label(settings_frame, text="Buffer Size:").grid(row=3, column=0, sticky=tk.W)
-        self.buffer_size = tk.IntVar(value=30)
-        ttk.Spinbox(settings_frame, from_=1, to=100, increment=1, textvariable=self.buffer_size, width=10).grid(row=3, column=1, sticky=tk.W)
+
+        self.buffer_label = ttk.Label(settings_frame, text="Buffer Size:")
+        self.buffer_label.grid(row=3, column=0, sticky=tk.W)
+        self.buffer_size = tk.IntVar(value=30) # MOVED UP
+        self.buffer_spinbox = ttk.Spinbox(settings_frame, from_=1, to=100, increment=1, textvariable=self.buffer_size, width=10)
+        self.buffer_spinbox.grid(row=3, column=1, sticky=tk.W)
+        # self.buffer_spinbox.config(textvariable=self.buffer_size) # This line is redundant now
+
+        # --- New Checkbox ---
+        self.sky_mask_check = ttk.Checkbutton(settings_frame, text="Use Sky Mask Pre-processing", 
+                                              variable=self.use_sky_mask, command=self._toggle_widget_state)
+        self.sky_mask_check.grid(row=4, column=0, columnspan=2, sticky=tk.W, pady=(5,0))
+        
 
         # --- Post-processing ---
         post_proc_frame = ttk.LabelFrame(main_frame, text="Post-processing", padding="10")
@@ -424,12 +530,12 @@ class DepthVideoGUI:
 
         # Gamma Correction
         gamma_check = ttk.Checkbutton(post_proc_frame, text="Apply Gamma Correction", variable=self.use_gamma, command=self._toggle_widget_state)
-        gamma_check.grid(row=4, column=0, columnspan=2, sticky=tk.W, pady=(5,0))
+        gamma_check.grid(row=0, column=0, columnspan=2, sticky=tk.W, pady=(5,0)) # Changed row
         
         self.gamma_label = ttk.Label(post_proc_frame, text="Gamma:")
-        self.gamma_label.grid(row=5, column=0, sticky=tk.W, padx=(20,0))
+        self.gamma_label.grid(row=1, column=0, sticky=tk.W, padx=(20,0)) # Changed row
         self.gamma_spinbox = ttk.Spinbox(post_proc_frame, from_=0.1, to=5.0, increment=0.1, textvariable=self.gamma_value, width=8)
-        self.gamma_spinbox.grid(row=5, column=1, sticky=tk.W)
+        self.gamma_spinbox.grid(row=1, column=1, sticky=tk.W) # Changed row
 
         self._toggle_widget_state() # Set initial state
 
@@ -464,7 +570,22 @@ class DepthVideoGUI:
                 child.grid_configure(padx=5, pady=2)
 
     def _toggle_widget_state(self):
-        # Gamma controls
+        # --- New logic for scaler widgets ---
+        sky_mask_enabled = self.use_sky_mask.get()
+        # scaler_enabled = not sky_mask_enabled # <-- REMOVED
+        
+        # self.decay_label.config(state=tk.NORMAL if scaler_enabled else tk.DISABLED)
+        # self.decay_spinbox.config(state=tk.NORMAL if scaler_enabled else tk.DISABLED)
+        # self.buffer_label.config(state=tk.NORMAL if scaler_enabled else tk.DISABLED)
+        # self.buffer_spinbox.config(state=tk.NORMAL if scaler_enabled else tk.DISABLED)
+        
+        # --- The scaler widgets are now always enabled ---
+        self.decay_label.config(state=tk.NORMAL)
+        self.decay_spinbox.config(state=tk.NORMAL)
+        self.buffer_label.config(state=tk.NORMAL)
+        self.buffer_spinbox.config(state=tk.NORMAL)
+
+        # --- Existing logic for gamma ---
         gamma_enabled = self.use_gamma.get()
         self.gamma_label.config(state=tk.NORMAL if gamma_enabled else tk.DISABLED)
         self.gamma_spinbox.config(state=tk.NORMAL if gamma_enabled else tk.DISABLED)
@@ -490,6 +611,10 @@ class DepthVideoGUI:
                     self.batch_size.set(config.get("batch_size", 1))
                     self.decay.set(config.get("decay", 0.9))
                     self.buffer_size.set(config.get("buffer_size", 30))
+                    # --- Load new setting ---
+                    self.use_sky_mask.set(config.get("use_sky_mask", False))
+                    
+            self._toggle_widget_state() # Ensure state is correct on load
         except (json.JSONDecodeError, IOError) as e:
             messagebox.showerror("Error", f"Could not load settings: {e}")
 
@@ -500,7 +625,9 @@ class DepthVideoGUI:
             "resolution": self.resolution.get(),
             "batch_size": self.batch_size.get(),
             "decay": self.decay.get(),
-            "buffer_size": self.buffer_size.get()
+            "buffer_size": self.buffer_size.get(),
+            # --- Save new setting ---
+            "use_sky_mask": self.use_sky_mask.get()
         }
         try:
             with open(self.config_file, 'w') as f:
@@ -581,6 +708,9 @@ class DepthVideoGUI:
             decay = self.decay.get()
             buffer_size = self.buffer_size.get()
             
+            # --- Get new setting ---
+            use_sky_mask = self.use_sky_mask.get()
+            
             video_files = [f for f in os.listdir(input_dir) if f.lower().endswith(('.mp4', '.avi', '.mov', '.mkv'))]
             if not video_files:
                 self.progress_queue.put({"error": "No video files found in the input folder."})
@@ -629,7 +759,10 @@ class DepthVideoGUI:
                     })
                 
                 try:
+                    # Conditionally create scaler
+                    # --- Scaler is now ALWAYS created ---
                     scaler = EMAMinMaxScaler(decay=decay, buffer_size=buffer_size)
+                        
                     process_video(
                         video_input=input_path,
                         video_output=output_path,
@@ -638,19 +771,22 @@ class DepthVideoGUI:
                         batch_size=batch_size,
                         progress_callback=file_progress_callback,
                         stop_event=self.stop_processing,
-                        scaler=scaler,
+                        scaler=scaler, # Will always pass the scaler
                         use_gamma=self.use_gamma.get(),
-                        gamma_value=self.gamma_value.get()
+                        gamma_value=self.gamma_value.get(),
+                        use_sky_mask_norm=use_sky_mask # <-- Pass new flag
                     )
                 except InterruptedError:
                     break # Stop the outer loop as well
                 except Exception as e:
+                    _logger.exception(f"Error while processing {filename}") # Log full traceback
                     self.progress_queue.put({"error": f"Failed to process {filename}: {e}"})
                     continue # Move to the next video
 
             self.progress_queue.put({"processing_done": True})
 
         except Exception as e:
+            _logger.exception("Error in main processing loop") # Log full traceback
             self.progress_queue.put({"error": str(e)})
 
 # --- End of content from gui.py ---
