@@ -10,6 +10,7 @@ import numpy as np
 import logging
 import matplotlib.pyplot as plt  # For the _test function
 from depth_anything_3.api import DepthAnything3
+from depth_anything_3.utils.alignment import compute_sky_mask
 
 # --- Content from utils.py ---
 
@@ -294,10 +295,22 @@ def process_video(video_input, video_output, model, process_res, batch_size=1, p
                     frames_rgb,
                     process_res=process_res
                 )
+                non_sky_mask = compute_sky_mask(prediction.sky, threshold=0.3)
+
+                # Ensure we have enough non-sky pixels
+                assert non_sky_mask.sum() > 10, "Insufficient non-sky pixels for scaling"
                 
                 processed_frames_to_write = []
                 for i in range(len(frames_buffer)):
                     depth_map = prediction.depth[i]
+
+                    frame_non_sky_mask = non_sky_mask[i]
+                    non_sky_depth = depth_map[frame_non_sky_mask]
+
+                    non_sky_max_depth  = non_sky_depth.max()
+                    
+                    #set the sky to be the same depth as the most far away non sky thing
+                    depth_map[~frame_non_sky_mask] = non_sky_max_depth
                     
                     if scaler:
                         frame_tensor = scaler(torch.from_numpy(depth_map).to(model.device))
